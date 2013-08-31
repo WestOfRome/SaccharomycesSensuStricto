@@ -1,0 +1,702 @@
+#!/usr/bin/perl 
+
+# Devin Scannell (c) 2011, 2012 
+# devin.scannell@gmail.com 
+
+if ( $ARGV[0] =~ /help/i ) {
+    print <<USAGE;
+
+    Simple CGI website to support Scannell and Zill et al., 2011 in G3: 
+    
+    The awesome power of yeast evolutionary genetics: 
+    New genome sequences and strain resources for the Saccharomyces sensu stricto genus
+    
+    $0 data=[Strains|Reads|Browsers|...] version=[Feb2011|Apr2011|current|submission1]
+
+    We read live directories (symlinked to live..) to look up most data.  
+    Specific (older) datasets can be accessed with 'version' url param. 
+    
+USAGE
+exit;
+}
+
+use lib $ENV{'PERL5LIB'};
+
+use CGI::Pretty qw/:standard *table/;
+use Spreadsheet::ParseExcel;
+use HTML::Email::Obfuscate;
+
+########################################################
+# PARSE CGI
+########################################################
+
+# capture basic data from cgi url. 
+# we do this first purely so we can get the data 'version' 
+# to use for building paths. 
+
+# the url should look like one of these.... 
+# http://www.SaccharomycesSensuStricto.org/cgi-bin/s3?data=Assemblies&version=current
+# http://yourserver.university.edu/cgi-bin/s3?data=Assemblies&version=current
+
+my $cgi = CGI->new();
+
+# 1. capture the url 
+my $selfurl = $cgi->self_url; # visited 
+my $sss_cgi_url = $sss_base_url.'/cgi-bin/'.$cgi->url(-relative => 1); # construct SSS verstion of url 
+# two URLs are identical unless the user visited allele directly (ie not www.SSS.org)
+
+# 2. capture key=var values from URL (can be any number) 
+my %params = $cgi->Vars;
+die("Must supply website version") unless 
+    my $version = (exists $params{'version'} ? $params{'version'} : 'current' );
+#my @params = $cgi->param;
+
+
+########################################################
+# URLS. 
+########################################################
+
+my $sss_base_url = 'http://www.SaccharomycesSensuStricto.org';
+
+my $g3_article_url = 'http://www.g3journal.org/content/1/1/11.full';
+my $g3_supp_url = 'http://www.g3journal.org/content/suppl/2011/06/20/1.1.11.DC1/';
+
+my $sgd_url = 'http://www.yeastgenome.org/cgi-bin/locus.fpl?locus=';
+my $ygob_url = 'http://wolfe.gen.tcd.ie/cgi/browser/browser.pl?ver=v5-Jan2011&win=15&gene=';
+my $gbrowse_url = 'https://payen-gbrowse.gs.washington.edu/gb2/gbrowse/';
+
+my $fsa_url =  'http://orangutan.math.berkeley.edu/fsa/';
+my $soap_url = 'http://soap.genomics.org.cn/soapdenovo.html';
+my $sgd_url = 'http://www.yeastgenome.org';
+
+########################################################
+# PATHS. 
+########################################################
+
+# Set some paths. 
+
+# 1. top level directories 
+my $web_root = '/Library/Webserver/Documents/';            # all website data must go here for OS X 
+my $project_root = '/SaccharomycesSensuStrictoResources/'; # the name of this project/website directory 
+my $data_root = $project_root."/$version/";                # SSS version. 
+# /Library/WebServer/Documents/SaccharomycesSensuStrictoResources/1300840434/
+
+# Note on Versions.  
+# Versions can be anything. e.g. Date stamps such as 1300840434. 
+# You can also have symlinks from "Apr2011" -> 1300840434
+# and from "current" -> 1300840434. 
+# all three are acceptable "versions" and point to the same data. 
+# /Library/WebServer/Documents/SaccharomycesSensuStrictoResources/1300840434/
+# /Library/WebServer/Documents/SaccharomycesSensuStrictoResources/current
+
+#######################
+
+# 2. data that does not depend on version number are in $project_root (as from 1 above)
+# e.g. figures from paper and strain tables 
+# This is fairly particular to the current site set up and could probably be cleaned up. 
+
+# project root: figs
+my $fig1_jpg = $project_root.'/figs/Fig1_TreeCartoon_20110417_50p.jpeg';
+# project root: reads 
+my $read_dir = $project_root.'/reads/';
+# project root: tables  
+my $table_orthologs_tab = $project_root.'/tables/Supp_Table1_OrthologSets.xls';
+my $table6_strains_download = $project_root.'/tables/Table6_StrainResources_ChrisOliverRevised2.xls';
+my $table6_strains_xls = $web_root.$table6_strains_download; # read version of above. see note below. 
+# project root: hmm models
+my $ygob_hmm_path = $project_root.'/ygobhmms/';
+
+#######################
+
+# 3. data that DO depend on the version (ie annotations).
+# all use $data_root as defined in 1 above. 
+
+# paths to serve data for download...
+my $coding = $data_root.'/aligns/coding/';
+my $noncoding = $data_root.'/aligns/noncoding/';
+
+# actual paths to file for reading etc. 
+my $alignDir = $web_root.$coding;
+my $noncodingDir = $web_root.$noncoding;
+
+# Note on Paths
+# There are two possible paths that you might want. 
+# 1. The full path from /. This is needed to open and read files etc. 
+# We do this for the strain table -- the cgi is built directly from an xls so to 
+# change the webpage all you do is change the xls.
+# 2. The path relative to project_root. This is sufficient (and required) to 
+# serve files for download. 
+
+# yes, my file name convention could be much better but I did it 
+# in a hurry. 
+
+########################################################
+# HARDCODED VARS. 
+########################################################
+
+my $fh = STDOUT; # this must point to STDOUT in order to write html to browser. 
+# if script run from commandline, output goes to terminal. good for debugging. 
+
+# this just sets the left - right order of links on the pages. 
+my %main = (
+    'Orthologs' => 4,
+    'Reads' => 1,
+    'Assemblies' => 2,
+#    'Manuscript' => 1,
+    'Browsers' => 6,
+    'Contact' => 8,   
+    'Telomeres' => 7,       
+    'Strains' => 0,
+    'Annotations' => 3,
+    'Intergenics' => 5,
+    'Supplementals' => -1
+);
+
+my %species = (
+    'Scer' => i('S. cerevisiae'),
+    'Spar' => i('S. paradoxus'),
+    'Smik' => i('S. mikatae').' (IFO 1815 '.sup('T').')',
+    'Skud' => i('S. kudriavzevii').' (IFO 1802 '.sup('T').')',
+    'Port' => i('S. kudriavzevii').' (ZP 591)',
+    'Sbay' => i('S. bayanus').' var. '.i('uvarum').' (CBS 7001)',
+);
+
+my %gb = (
+    'Smik' => 'Smikatae',
+    'Skud' => 'Skud',
+    'Port' => 'Skudriavzevii',
+    'Sbay' => 'Sbayanus',
+);
+
+my %obfuscate = (
+    'DRS' => 'author.email@address.org',
+    'OZ' => 'author.email@address.org',
+    'CP' => 'author.email@address.org',
+    'CTH' => 'author.email@address.org'
+);
+
+
+########################################################
+########################################################
+# NO MORE USER SETTABLE VARS. MAIN PROGRAM. 
+########################################################
+########################################################
+
+
+########################################################
+# WRITE NEW CGI 
+########################################################
+
+&htmlHeaders();
+
+if ( ! $cgi->param ) {
+    
+    ############################
+    # Homepage. Print title, abstract etc 
+    ############################
+
+    &defineLongVars();       
+    print $fh $cgi->h3( {-align => center, -color => blue}, $title );
+    print $fh $cgi->h5( {-align => center, -color => blue}, $authors  );
+    print $fh $cgi->blockquote( $abstract );
+    
+    print $fh p;
+    print $fh $cgi->blockquote(
+	{-align => center}, 
+	$cgi->a( {href => $g3_article_url }, 
+		 $cgi->h3( {-align => center, -color => blue},"Paper now available (Open Access) in the inaugural issue of G3!") )
+	);
+    print $fh p;
+    print $fh $cgi->h5( {-align => center, -color => blue}, '' );
+    print $fh p;
+    
+    # print image 
+    print $fh '<p align=center>'.
+	$cgi->img( {
+	    src => $fig1_jpg,     
+	    style => 'float:center', # does nothing 
+	    border => 0,
+		   } ).'</p>';  
+
+    # make links to Other pages 
+    print $fh p; # , $cgi->blockquote({-align => 'center'}, "Please choose from the following"), p;
+    &printNavigationLinks();
+    
+} elsif ( exists $params{'data'} ) {
+
+    ############################
+    # Data pages. 1 section per page. none too complicated. 
+    ############################
+    
+    print $fh p;
+    &printNavigationLinks();
+    print $fh p,hr,p;
+
+    ########################################################    
+    if ( $params{'data'} eq 'Contact' ) {
+
+        &defineLongVars();    
+
+        print $fh $cgi->h3( {-align => center, -color => blue}, "Contact Information" );        
+        print $fh $cgi->blockquote( {-align => center}, $contact );
+        
+        print $fh $cgi->h3( {-align => center, -color => blue}, "Consortium Information" );        
+        print $fh $cgi->blockquote( {-align => center}, $consortium );
+
+
+    ########################################################        
+    } elsif ( $params{'data'} eq 'Strains' ) {
+        print $fh $table6_strains_xls unless -e $table6_strains_xls;
+
+	print $fh p;
+        print $fh $cgi->blockquote(
+            {-align => center}, 
+            "Strain summary can be downloaded ".
+            $cgi->a( {href => $table6_strains_download }, 'here').
+            " (".&returnFileTypeAndSize( $web_root.$table6_strains_download ).")."
+            );
+        print $fh p;
+        
+        my $parser = Spreadsheet::ParseExcel->new();
+        my $ss = $parser->parse( $table6_strains_xls ) || die $table6_strains_xls;
+        my ($matrix, @jnk) = $ss->worksheets();
+        my ( $row_min, $row_max ) = $matrix->row_range();
+        my ( $col_min, $col_max ) = $matrix->col_range(); 
+    
+        print $fh $cgi->start_table( 
+            {-border => 1, 
+            -align => 'center', 
+            -span => 6, 
+            -width => 1400,
+            -cellpadding => 1} 
+            );    
+    
+        for my $row ( $row_min..$row_max  ) {
+            my $meth = ( $row == 0 || ! $matrix->get_cell( $row, 2) ? 'th' : 'td');
+            print $fh $cgi->Tr(
+                {-align => 'center', -valign => 'center'},
+                # itlas for 
+                (map { $cgi->$meth( {-width => 150}, (/^S\.\s[cpmkb]/ ? i($_) : $_ ) ) } 
+                map { defined($_) ? $_->unformatted : $_ } 
+                map { $matrix->get_cell( $row, $_ ) } ($col_min.. ($col_max-1) )), 
+                # notes 
+                (map {$cgi->$meth({-width => 800}, (defined($_) ? $_->unformatted : $_) ) } 
+                $matrix->get_cell( $row, $col_max ))                
+            );
+        }
+        print $fh $cgi->end_table;
+
+
+    ########################################################        
+    } elsif ( $params{'data'} =~ /^Alignments|Orthologs|Coding$/  ) {
+    
+        print $fh p;
+	print $fh p;
+	print $fh $cgi->blockquote(
+            {-align => center}, 
+            "All alignments can be downloaded as a single (34M) ".
+            $cgi->a( {href => $data_root.'/aligns/coding_allfiles.fasta.tgz'}, 'tarball.' )
+	    );
+        
+        print $fh $cgi->blockquote(
+            {-align => center}, 
+            "Orthology relationships among protein-coding genes are described ".
+            $cgi->a( {href => $table_orthologs_tab }, 'here').
+            " ( ".&returnFileTypeAndSize( $web_root.$table_orthologs_tab )." )."
+            );
+        print $fh $cgi->blockquote(
+            {-align => center}, 
+            "Alignments were produced using ".
+            $cgi->a( {href => $fsa_url}, 'FSA' ).
+            ' (Bradley et al., 2009).'
+	    );
+	
+	print $fh p;
+	
+        print $fh $cgi->start_table( 
+            {-border => 1, 
+	     -align => 'center', 
+	     -span => 5, 
+	     -width => 1000,
+	     -cellpadding => 1} 
+            );
+	
+        print $fh $cgi->Tr(
+	    {-align => 'center', -valign => 'center'},
+	    $cgi->th( "Sequences (fsa)" ),
+	    $cgi->th( "Codon Alignments"),
+	    $cgi->th( "SGD Locus Page" ),
+	    $cgi->th( "YGOB Synteny View" ),
+	    $cgi->th( "YGOB HMM" )
+            );
+	
+        for my $file ( `ls $alignDir | grep fsa` ) {
+            $file =~ /([^\/]+)\.fsa/;
+            my $root = $1;
+            $file =~ /(OG\d+)_(Y[^_]+|NOSGD)_(Anc[^\:]+)/;
+            my ($og,$sgd,$ygob)=($1,$2,$3);
+	    
+            print $fh $cgi->Tr(
+                {-align => 'center', -valign => 'center'},
+                $cgi->td( $cgi->a( {href => $coding.$root.'.fsa' }, $root ) ),
+                $cgi->td( $cgi->a( {href => $coding.$root.'.codon.mfa' }, 'codons.mfa' ) ),
+                $cgi->td( $cgi->a( {href => $sgd_url.$sgd }, $sgd ) ),
+                $cgi->td( $cgi->a( {href => $ygob_url.$ygob }, $ygob ) ),
+                $cgi->td( $cgi->a( {href => $ygob_hmm_path.$ygob.'.h3m' }, $ygob.'.h3m' ) ),
+		);
+        }
+        print $fh $cgi->end_table;
+
+
+    ########################################################    	
+    } elsif ( $params{'data'} eq 'Supplementals'  ) {
+	
+	$SI_links  = 
+	    p.'Supplemental Information is Open Access at G3:'.
+	    p.a( { href => $g3_supp_url.'/000273SI.pdf' }, 'Summary PDF and Legends' ).
+	    p.a( { href => $g3_supp_url.'/FigureS1.pdf' }, 'Fig S1. Multiple sequence alignment of centromere (pdf)' ).
+	    p.a( { href =>  $g3_supp_url.'/TableS2.pdf' }, 'Table S2. GOB-HMM families detected in representative strains of five Saccharomyces species (pdf)' ).
+	    p.a( { href =>  $g3_supp_url.'/FileS1.xls' }, 'Dataset 1. Likelihood-ratio tests for variation in selection pressure (xls)' ).
+	    p.a( { href =>  $g3_supp_url.'/FileS2.xls' }, 'Dataset 2. Complete lists of candidate gene gains and losses detected by computational screens (xls)' ).
+	    p.a( { href =>  $g3_supp_url.'/TableS1.xls' }, 'Table S1. Genes orthologous among representative strains of five Saccharomyces sensu stricto yeast species (xls)' ).
+	    p.a( { href =>  $g3_supp_url.'/TableS3.xls' }, 'Table S3. tRNA gene content (xls)' ).
+	    p;
+
+        print $fh $cgi->blockquote( {-align => center}, $SI_links );
+
+
+    ########################################################            
+  } elsif ( $params{'data'} eq 'Intergenics'  ) {
+    
+     print $fh p;
+           print $fh $cgi->blockquote(
+            {-align => center}, 
+            "Alignments were produced using ".
+            $cgi->a( {href => $fsa_url }, 'FSA' ).
+            ' (Bradley et al., 2009).'
+        );
+     print $fh p;
+           print $fh $cgi->blockquote(
+            {-align => center}, 
+            "All intergenics can be downloaded as a single ".
+            $cgi->a( {href => $data_root.'/aligns/noncoding_orthogroups.fsa.tgz'}, 'tarball.' )
+        );
+        
+     print $fh p;
+ 
+        print $fh $cgi->start_table( 
+            {-border => 1, 
+	     -align => 'center', 
+	     -span => 4, 
+	     -width => 1000,
+	     -cellpadding => 1} 
+            );
+     
+     print $fh $cgi->Tr(
+	 {-align => 'center', -valign => 'center'},
+	 $cgi->th( "Sequence" ),
+	 $cgi->th( "Alignment" ), 
+	 $cgi->th( "Upstream SGD Locus" ),
+	 $cgi->th( "Downstream SGD Locus" ),
+	 );
+     
+     for my $file ( `ls $noncodingDir | grep fsa` ) {
+	 $file =~ /([^\/]+)\.fsa/;
+	 my $root = $1;
+	 $file =~ /(Y.+)[ud]_(Y.+)[ud]/;
+	 my ($up,$dn)=($1,$2);
+	 
+	 print $fh $cgi->Tr(
+	     {-align => 'center', -valign => 'center'},
+	     $cgi->td( $cgi->a( {href => $noncoding.$root.'.fsa' }, $root ) ),
+	     $cgi->td( $cgi->a( {href => $noncoding.$root.'.mfa' }, 'mfa' ) ),
+	     $cgi->td( $cgi->a( {href => $sgd_url.$up }, $up ) ),
+	     $cgi->td( $cgi->a( {href => $sgd_url.$dn }, $dn ) )
+	     );
+     }
+     print $fh $cgi->end_table;
+  
+
+    ########################################################         
+  } elsif ( $params{'data'} eq 'Assemblies'  ) {
+      
+      print $fh p;
+      print $fh $cgi->blockquote(
+	  {-align => center}, 
+	  $cgi->a( {href => $sss_cgi_url.'?data=Reads'."&version=$version"  }, "Illumina paired-end libraries").            
+	  " were assembled using ".
+	  $cgi->a( {href => $soap_url }, 'SOAPdenovo').
+	  "in conjunction with ".
+	  $cgi->a( {href => $sss_cgi_url.'?data=Telomeres'."&version=$version"  }, 'pre-existing Sanger libraries.').
+	  p.
+	  "The ".i("S. cerevisie")." and ".i("S. paradoxus")." assemblies are from the ".
+	  $cgi->a( {href => $sgd_url }, 'Saccharomyces Genome Database').
+	  " and ".
+	  $cgi->a( {href => 'http://www.ncbi.nlm.nih.gov/pubmed/19212322' }, 'Liti et al., 2009').
+	  " respectively."
+	  );
+      print $fh p;   
+    
+      print $fh $cgi->start_table( 
+	  {-border => 1, 
+	   -align => 'center', 
+	   -span => 4, 
+	   -width => 700,
+	   -cellpadding => 1} 
+	  );
+      
+      print $fh $cgi->Tr( 
+	  {-align => 'center', -valign => 'center'},
+	  ( map { $cgi->th( $_ ) } qw(Species Unordered(All) Ordered Unplaced) )        
+	  );
+      
+      for my $sp (  keys %species ) {        
+	  print $fh $cgi->Tr(
+	      {-align => 'center', -valign => 'center'},
+	      $cgi->td( i($species{$sp}) ),
+	      $cgi->td( $cgi->a( {href => $data_root.$sp."/$sp.scaffolds" }, 'Scaffolds' ) ),
+	      $cgi->td( $cgi->a( {href => $data_root.$sp."/$sp.ultrascaf" }, 'Ultra-scaffolds' ) ),
+	      $cgi->td( $cgi->a( {href => $data_root.$sp."/$sp.unplaced" }, 'Unplaced' ) )
+	      );
+      }
+      print $fh $cgi->end_table;        
+
+      
+    ########################################################          
+  } elsif ( $params{'data'} eq 'Reads'  ) {
+      # ln -s s_*_1_sequence.txt.gz 1.fsq.gz ; ln -s s_*_2_sequence.txt.gz 2.fsq.gz
+      
+      print $fh p;
+      print $fh $cgi->blockquote(
+	  {-align => center}, 
+	  'Reads were cleaned using '.
+	  $cgi->a( {href => '/SensuStricto/scripts/fsq2fsa' }, 'fsq2fsa').            
+	  ' and can also be downloaded from the '.
+	  $cgi->a( {href => 'http://ncbi.nlm.nih.gov/sra' }, 'Short Read Archive').
+	  ' as SRP006340 of SRA034902.'.
+	  p."Sanger reads used for co-assembly are ".            
+	  $cgi->a( {href => $sss_cgi_url.'?data=Telomeres'."&version=$version"  }, 'here.')
+	  );
+      print $fh p; 
+#             "Illumina paired-end libraries (51-114bp reads; 203-437bp inserts) ".
+      
+      print $fh $cgi->start_table( 
+	  {-border => 1, 
+	   -align => 'center', 
+	   -span => 9, 
+	   -width => 1200,
+	   -cellpadding => 1} 
+	  );
+      
+      print $fh $cgi->Tr( 
+	  {-align => 'center', -valign => 'center'},
+	  ( map { $cgi->th( $_ ) } qw(Species Raw1 Raw2 RawComp RawQuals Clean1 Clean2 CleanComp CleanQuals) )        
+	  );
+      
+      for my $sp (  grep {!/Scer|Spar/} keys %species ) {        
+	  print $fh $cgi->Tr(
+	      {-align => 'center', -valign => 'center'},
+	      $cgi->td( $species{$sp} ),                
+	      ( map { $cgi->td( $cgi->a( {href => $_ }, &returnFileTypeAndSize( $web_root.$_ ) ) ) } 
+                map { $data_root."/reads/$sp/$_" } 
+                qw(1.fsq.gz 2.fsq.gz rawBaseComposition.eps rawBaseQuality.eps 1.fsa.gz 2.fsa.gz cleanBaseComposition.eps cleanBaseQuality.eps) )
+	      );
+      }
+      print $fh $cgi->end_table;
+
+
+    ########################################################          
+  } elsif ( $params{'data'} eq 'Annotations'  ) {
+      
+      print $fh $cgi->start_table( 
+	  {-border => 1, 
+	   -align => 'center', 
+	   -span => 10, 
+	   -width => 1200,
+	   -cellpadding => 1} 
+	  );
+      
+      print $fh $cgi->Tr( 
+	  {-align => 'center', -valign => 'center'},
+	  ( map { $cgi->th( $_ ) } ('Species', 'Summary', 'GFF', 'Fasta (all features)', 'Proteins', 'YGOB Hits', 'Ohnolog Pairs') )        
+	  );
+      
+      for my $sp (keys %species ) {        
+	  print $fh $cgi->Tr(
+	      {-align => 'center', -valign => 'center'},
+	      $cgi->td( $species{$sp} ),                
+	      ( map { $cgi->td( $cgi->a( {href => $data_root.$sp."/$sp".".$_" }, "$sp".".$_" ) ) } 
+                qw(summary gff fsa aa ancloci ohnologs) )
+	      );
+      }
+      print $fh $cgi->end_table;     
+
+
+    ########################################################          
+  } elsif ( $params{'data'} eq 'Browsers'  ) {
+    
+      print $fh $cgi->start_table( 
+	  {-border => 1, 
+	   -align => 'center', 
+	   -span => 1, 
+	   -width => 300,
+	   -cellpadding => 1} 
+	  );            
+      
+      for my $sp ( grep {!/Scer|Spar/} keys %gb ) {        
+	  print $fh $cgi->Tr(
+	      {-align => 'center', -valign => 'center'},                
+	      $cgi->td( $cgi->a( {href => $gbrowse_url.$gb{$sp} }, $species{$sp} ) ) 
+	      );
+      }
+      print $fh $cgi->end_table;     
+      
+
+
+    ########################################################          
+  } elsif ( $params{'data'} =~ /Telomeres|Challenge/  ) {
+      
+      print $fh p;
+      print $fh $cgi->blockquote(
+	  {-align => center, -width => 100, -justify => 'left'}, 
+	  p.'Accurate assembly of repitive regions such telomeres and sub-telomeric regions remains a challenge.'.
+	  p.'We invite the community to use the Illumina '.
+	  a( { href => $sss_cgi_url.'?data=Reads'."&version=$version" }, 'libraries we have sequenced').' as well as additional sanger libraries '.
+	  p.'we have gathered from the literature to obtain complete, contiguous error free assemblies of these regions.'.
+	  p.$cgi->a( {href => 'http://www.ncbi.nlm.nih.gov/pubmed/12775844' }, 'Cliften '.i('et al').'., 2003 (Science)').
+	  p.$cgi->a( {href => 'http://www.ncbi.nlm.nih.gov/pubmed/12748633' }, 'Kellis '.i('et al').'., 2003 (Nature)')
+	  );
+      print $fh p;         
+      
+      print $fh $cgi->start_table( 
+	  {-border => 1, 
+	   -align => 'center', 
+	   -span => 5, 
+	   -width => 800,
+	   -cellpadding => 1} 
+	  );
+      
+      print $fh $cgi->Tr( 
+	  {-align => 'center', -valign => 'center'},
+	  ( map { $cgi->th( $_ ) } ('Species', 'WashU Raw', 'WashU Clean', 'MIT Raw', 'MIT Clean') )        
+	  );
+      
+      for my $sp ( grep {!/Scer|Spar|Port/} keys %species ) {        
+	  print $fh $cgi->Tr(
+	      {-align => 'center', -valign => 'center'},
+	      $cgi->td( $species{$sp} ),
+	      ( map { $cgi->td( $cgi->a( {href => $read_dir.$_ }, &returnFileTypeAndSize( $web_root.$read_dir.$_ ) ) ) } 
+		map { $sp."_".$_ } qw(Cliften03.raw.tgz Cliften03.clean.gz Kellis03.raw.tgz Kellis03.clean.gz) )
+	      );
+      }
+      print $fh $cgi->end_table; 
+      
+    }
+}
+
+print $fh $cgi->end_html; 
+
+exit;
+
+
+
+########################################################
+# Hide Ugy Subroutines 
+########################################################
+
+sub defineLongVars { 
+
+$title = 
+'The awesome power of yeast evolutionary genetics: New genome sequences and strain resources for the '.i("Saccharomyces sensu stricto").' genus';
+
+$authors = 
+'Devin R. Scannell*, Oliver A. Zill*, Antonis Rokas, Celia Payen, '.
+'Maitreya J. Dunham, Michael B. Eisen, Jasper Rine, Mark Johnston, Chris Todd Hittinger'.
+p.'* Co-first authors listed alphabetically';
+
+$abstract = 
+"High-quality, well-annotated genome sequences and standardized laboratory strains fuel experimental and evolutionary research. We present improved genome sequences of three species of ".
+i("Saccharomyces sensu stricto")." yeasts: $species{'Sbay'}, $species{'Skud'}, $species{'Port'}, and $species{'Smik'}".
+", and describe their comparison to the genomes of $species{'Scer'} and $species{'Spar'}".
+"The new sequences, derived by assembling millions of short DNA sequence reads together with previously published Sanger shotgun reads, have vastly greater long-range continuity and far fewer gaps than the currently available genome sequences, and enable previously impossible analyses. New gene predictions defined a set of 5,261 protein-coding orthologs across the five most commonly studied ".i("Saccharomyces")." yeasts, enabling a re- examination of the tempo and mode of yeast gene evolution and improved inferences of species-specific gains and losses. To facilitate experimental investigations, we generated genetically marked, stable haploid strains for all three of these ".i('Saccharomyces')." species. These nearly complete genome sequences and the collection of genetically marked strains provide a valuable toolset for comparative studies of gene function, metabolism, and evolution, and render ".i('Saccharomyces sensu stricto')." the most experimentally tractable model genus.";
+
+my $email = HTML::Email::Obfuscate->new( javascript => 1 );
+
+$contact = 
+p.'Please put the tag SSS: in your email title to ensure your message is not misidentified as spam!'.
+p.'All '.b('strains').' are available from Chris Hittinger : '.$email->escape_html( $obfuscate{'CTH'} ).
+p.'For information regarding '.b('datasets and downloads').' please contact Devin Scannell : '.$email->escape_html( $obfuscate{'DRS'} ).
+p.'For '.b('browser').' related queries please contact Celia Payen : '.$email->escape_html( $obfuscate{'CP'} ).
+p.'Please direct '.b('all other inquiries').' to either CTH (as above) or Oliver Zill : '.$email->escape_html( $obfuscate{'OZ'} ).p;
+
+$consortium  = 
+p.'The following labs (alphabetical listing) contributed to this project: '.
+p.a( { href => 'http://dunham.gs.washington.edu/' }, 'Dunham Lab' ).
+p.a( { href => 'http://www.eisenlab.org/' }, 'Eisen Lab' ).
+p.a( { href => 'http://hittinger.genetics.wisc.edu/' }, 'Hittinger Lab' ).
+p.a( { href => 'http://www.ucdenver.edu/academics/colleges/medicalschool/departments/biochemistry/Research/PrimaryFaculty/Pages/Johnston.aspx' }, 'Johnston Lab' ).
+p.a( { href => 'http://mcb.berkeley.edu/labs/rine/' }, 'Rine Lab' ).
+p.a( { href => 'http://people.vanderbilt.edu/~antonis.rokas/' }, 'Rokas Lab' ).
+p;
+
+}
+
+sub htmlHeaders {
+    print $fh $cgi->header(
+        -type => 'text/html',  # image/jpeg 
+        );
+
+my $GOOGLEANALYTICS = <<BIGG;
+
+>>> insert analytics here as required <<<
+
+BIGG
+
+    print $fh $cgi->start_html(
+        -title => 'Saccharomyces Sensu Stricto Resources',
+        -xbase => $sss_base_url, # force base url 
+        # meta data 
+        -author => 'devin.scannell@gmail.com',
+        -meta => {'keywords' => 'saccharomyces yeast evolution comparative genomcis'},
+        # style sheets ect
+        -BGCOLOR => 'white', # unoficial but suported by browsers.. 
+        #-style => {'src' => '/styles/css/style1.css'},
+        -meta => {-http_equiv => 'Content-Type', -content => 'text/html'},  
+        #-script => {-type=>'JAVASCRIPT', -code => $GOOGLEANALYTICS }
+        -script => {-type=>'JAVASCRIPT', -src => '/SensuStricto/scripts/googleanalytics.js' }
+        );
+}
+
+sub printNavigationLinks {
+    my $links = scalar(keys %main)+1;
+    print $fh $cgi->table(
+        {-border => 0, -align => 'center', -span => $links, -width => $links*80}, # 
+        $cgi->Tr(
+            {-align => 'center', -valign => 'center'},
+            $cgi->th( $cgi->a( {href => $sss_cgi_url}, 'Main') ),
+            map { $cgi->th( $cgi->a( {href => $sss_cgi_url.'?data='.$_."&version=$version" }, $_) ) }  sort { $main{$a} <=> $main{$b} } keys %main        
+        )
+    );
+}
+
+sub returnFileTypeAndSize {
+    my $file = shift;
+    
+    return "NoData" unless -e $file;
+    
+    $file =~ /\.(\w+)$/ || die $file;
+    my $type = $1;
+    
+    my $size = `  stat -L $file | cut -d ' ' -f 8 `;
+    if ( $size > 1e9) {
+        $size = sprintf("%.1f", $size/1e9).'Gb'
+    } elsif ( $size > 1e6) {
+        $size = sprintf("%.1f", $size/1e6).'Mb'
+    } elsif ( $size > 1e3) {
+        $size = sprintf("%.1f", $size/1e3).'Kb';
+    } else {
+        $size .= 'bp';
+    }
+    return ( "$type, $size" );
+}
+
